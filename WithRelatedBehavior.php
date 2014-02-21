@@ -324,7 +324,7 @@ class WithRelatedBehavior extends CActiveRecordBehavior
 								array('{class}'=>get_class($owner),'{relation}'=>$name)));
 
 						$insertAttributes=array();
-						$deleteAttributes=array();
+                        $deleteAttributes=array();
 
 						foreach($related as $model)
 						{
@@ -343,18 +343,21 @@ class WithRelatedBehavior extends CActiveRecordBehavior
 							foreach($relatedMap as $pk=>$fk)
 								$joinTableAttributes[$fk]=$model->$pk;
 
-							if(!$newFlag)
-								$deleteAttributes[]=$joinTableAttributes;
-
 							$insertAttributes[]=$joinTableAttributes;
 						}
 
-						if($deleteAttributes!==array())
-						{
-							$condition=$builder->createInCondition($joinTable,array_merge(array_values($ownerMap),array_values($relatedMap)),$deleteAttributes);
-							$criteria=$builder->createCriteria($condition);
-							$builder->createDeleteCommand($joinTable,$criteria)->execute();
-						}
+                        // clear all references to related models for owner
+                        foreach ($ownerMap as $pk=>$fk)
+                        {
+                            $deleteAttributes[$pk]=$owner->$pk;
+                        }
+
+                        if($deleteAttributes!==array())
+                        {
+                            $condition=$builder->createInCondition($joinTable,array_values($ownerMap),$deleteAttributes);
+                            $criteria=$builder->createCriteria($condition);
+                            $builder->createDeleteCommand($joinTable,$criteria)->execute();
+                        }
 
 						foreach($insertAttributes as $attributes)
 							$builder->createInsertCommand($joinTable,$attributes)->execute();
@@ -410,33 +413,98 @@ class WithRelatedBehavior extends CActiveRecordBehavior
 
 	/**
 	 * @param string $name
-	 * @param mixed $keys
+	 * @param array $keys Array containing related model ids to unlink.
+     * @throws CDbException
+     * @return bool Success of unlink operation.
 	 */
-	public function unlink($name,$keys=null)
+	public function unlink($name,$keys=array())
 	{
+        if (empty($keys)) {
+            return false;
+        }
+
 		$owner=$this->getOwner();
 
 		if(!$owner->getMetaData()->hasRelation($name))
 			throw new CDbException(Yii::t('yiiext','The relation "{relation}" in active record class "{class}" is not specified.',
 				array('{class}'=>get_class($owner),'{relation}'=>$name)));
 
+        /** @var CDbConnection $db */
+        $db = $owner->getDbConnection();
+
+        if ($db->getCurrentTransaction() === null) {
+            $transaction = $db->beginTransaction();
+        }
+
+        // get builder and schema instance
 		$ownerTableSchema=$owner->getTableSchema();
 		$builder=$owner->getCommandBuilder();
 		$schema=$builder->getSchema();
+
+        // find relation type
 		$relation=$owner->getMetaData()->relations[$name];
 		$relationClass=get_class($relation);
 		$relatedClass=$relation->className;
+        $relatedTableSchema = CActiveRecord::model($relatedClass)->getTableSchema();
 
 		switch($relationClass)
-		{
+        {
 			case CActiveRecord::BELONGS_TO:
+                return false;
 				break;
 			case CActiveRecord::HAS_ONE:
+                return false;
 				break;
 			case CActiveRecord::HAS_MANY:
+                return false;
 				break;
 			case CActiveRecord::MANY_MANY:
+                // table containing links
+                $junctionTable = $relation->getJunctionTableName();
+                // check configuration
+                if (($joinTable = $schema->getTable($junctionTable)) === null)
+                    throw new CDbException(Yii::t('yiiext', 'The relation "{relation}" in active record class "{class}" is not specified correctly: the join table "{joinTable}" given in the foreign key cannot be found in the database.',
+                        array('{class}' => get_class($owner), '{relation}' => $name, '{joinTable}' => $junctionTable)));
+
+                $ownerFk = null;
+                $ownerPkValue = null;
+                $relatedFk = null;
+                $junctionKeys = $relation->getJunctionForeignKeys();
+                // validate relation and get FK information
+                foreach ($junctionKeys as $fk) {
+                    if (isset($joinTable->foreignKeys[$fk])) {
+                        list($tableName, $pk) = $joinTable->foreignKeys[$fk];
+                        if (!isset($ownerFk) && $schema->compareTableNames($ownerTableSchema->rawName, $tableName)) {
+                            $ownerPkValue = $owner->$pk;
+                            $ownerFk = $fk;
+                        } else if (!isset($relatedFk) && $schema->compareTableNames($relatedTableSchema->rawName, $tableName)) {
+                            $relatedFk = $fk;
+                        } else {
+                            throw new CDbException(Yii::t('yiiext', 'The relation "{relation}" in active record class "{class}" is not specified correctly: the foreign key "{key}" refers to the table "{table}" which is not part of this relation.',
+                                array('{class}' => get_class($owner), '{relation}' => $name, '{key}' => $fk, '{table}' => $tableName)));
+                        }
+                    } else {
+                        throw new CDbException(Yii::t('yiiext', 'The relation "{relation}" in active record class "{class}" is not specified correctly: the foreign key for "{key}" cannot be found in the database.',
+                            array('{class}' => get_class($owner), '{relation}' => $name, '{key}' => $fk)));
+                    }
+                }
+                // build mapping with foreign keys given
+                $deleteIds = array();
+                foreach ($keys as $key) {
+                    $deleteIds[] = array($ownerFk => $ownerPkValue, $relatedFk => $key);
+                }
+                // delete links from join table
+                if (!empty($deleteIds)) {
+                    $condition = $builder->createInCondition($joinTable, array($ownerFk, $relatedFk), $deleteIds);
+                    $criteria = $builder->createCriteria($condition);
+                    $builder->createDeleteCommand($joinTable, $criteria)->execute();
+                }
 				break;
 		}
+
+        if (isset($transaction))
+            $transaction->commit();
+
+        return true;
 	}
 }
